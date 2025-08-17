@@ -21,9 +21,9 @@ import logging
 from io import BytesIO
 from typing import Dict, Any, List
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
 from dotenv import load_dotenv
 
 import requests
@@ -50,16 +50,42 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, specify actual origins
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", 150))
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_frontend():
+    """Serve the main HTML interface"""
+    try:
+        with open("index2.html", "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        return HTMLResponse(content="<h1>Frontend not found</h1><p>Please ensure index.html is in the same directory as app.py</p>", status_code=404)
+
+
+def parse_keys_and_types(raw_questions: str):
+    """
+    Parses the key/type section from the questions file.
+    Returns:
+        keys_list: list of keys in order
+        type_map: dict key -> casting function
+    """
+    import re
+    pattern = r"-\s*`([^`]+)`\s*:\s*(\w+)"
+    matches = re.findall(pattern, raw_questions)
+    type_map_def = {
+        "number": float,
+        "string": str,
+        "integer": int,
+        "int": int,
+        "float": float
+    }
+    type_map = {key: type_map_def.get(t.lower(), str) for key, t in matches}
+    keys_list = [k for k, _ in matches]
+    return keys_list, type_map
+
+
+
 
 # -----------------------------
 # Tools
@@ -275,9 +301,8 @@ def plot_to_base64(max_bytes=100000):
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=100)
     buf.seek(0)
     img_bytes = buf.getvalue()
-    # if already under limit, return png data uri
     if len(img_bytes) <= max_bytes:
-        return "data:image/png;base64," + base64.b64encode(img_bytes).decode('ascii')
+        return base64.b64encode(img_bytes).decode('ascii')
     # try decreasing dpi/figure size iteratively
     for dpi in [80, 60, 50, 40, 30]:
         buf = BytesIO()
@@ -285,7 +310,7 @@ def plot_to_base64(max_bytes=100000):
         buf.seek(0)
         b = buf.getvalue()
         if len(b) <= max_bytes:
-            return "data:image/png;base64," + base64.b64encode(b).decode('ascii')
+            return base64.b64encode(b).decode('ascii')
     # if Pillow available, try convert to WEBP which is typically smaller
     try:
         from PIL import Image
@@ -298,21 +323,21 @@ def plot_to_base64(max_bytes=100000):
         out_buf.seek(0)
         ob = out_buf.getvalue()
         if len(ob) <= max_bytes:
-            return "data:image/webp;base64," + base64.b64encode(ob).decode('ascii')
+            return base64.b64encode(ob).decode('ascii')
         # try lower quality
         out_buf = BytesIO()
         im.save(out_buf, format='WEBP', quality=60, method=6)
         out_buf.seek(0)
         ob = out_buf.getvalue()
         if len(ob) <= max_bytes:
-            return "data:image/webp;base64," + base64.b64encode(ob).decode('ascii')
+            return base64.b64encode(ob).decode('ascii')
     except Exception:
         pass
-    # as last resort return a downsized PNG even if > max_bytes
+    # as last resort return downsized PNG even if > max_bytes
     buf = BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=20)
     buf.seek(0)
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode('ascii')
+    return base64.b64encode(buf.getvalue()).decode('ascii')
 '''
 
     # Build the code to write
@@ -470,50 +495,28 @@ def run_agent_safely(llm_input: str) -> Dict:
         return {"error": str(e)}
 
 
-# -----------------------------
-# FastAPI endpoint
-# -----------------------------
-# @app.post("/api/analyze")
-# async def analyze_data(file: UploadFile = File(...)):
-#     """
-#     Accepts a text file (questions.txt) - each question may be multi-line but the whole file is sent.
-#     We pass the file contents as the agent input.
-#     """
-#     try:
-#         raw = (await file.read()).decode("utf-8")
-#         # Build LLM input
-#         llm_input = f"Questions:\n{raw}\nRespond with a JSON object containing 'questions' and 'code' only."
-#         # Run agent safely with thread executor (respect LLM_TIMEOUT_SECONDS)
-#         import concurrent.futures
-#         with concurrent.futures.ThreadPoolExecutor() as ex:
-#             fut = ex.submit(run_agent_safely, llm_input)
-#             try:
-#                 result = fut.result(timeout=LLM_TIMEOUT_SECONDS)
-#             except concurrent.futures.TimeoutError:
-#                 raise HTTPException(408, "Processing timeout")
-#         if "error" in result:
-#             raise HTTPException(500, detail=result["error"])
-#         return JSONResponse(content=result)
-#     except HTTPException as he:
-#         raise he
-#     except Exception as e:
-#         logger.exception("analyze_data failed")
-#         raise HTTPException(500, detail=str(e))
+from fastapi import Request
 
-
-@app.post("/api/analyze")
-async def analyze_data(
-    questions_file: UploadFile = File(...),
-    data_file: UploadFile = File(None)
-):
-    """
-    Handles both cases:
-      1. questions_file + optional data_file
-      2. If data_file given: injects into LLM environment and instructs LLM to use df directly
-      3. If no data_file: works as before, scraping if needed
-    """
+@app.post("/api")
+async def analyze_data(request: Request):
     try:
+        form = await request.form()
+        questions_file = None
+        data_file = None
+
+        for key, val in form.items():
+            if hasattr(val, "filename") and val.filename:  # it's a file
+                fname = val.filename.lower()
+                if fname.endswith(".txt") and questions_file is None:
+                    questions_file = val
+                else:
+                    data_file = val
+
+        if not questions_file:
+            raise HTTPException(400, "Missing questions file (.txt)")
+
         raw_questions = (await questions_file.read()).decode("utf-8")
+        keys_list, type_map = parse_keys_and_types(raw_questions)
 
         pickle_path = None
         df_preview = ""
@@ -523,7 +526,7 @@ async def analyze_data(
             dataset_uploaded = True
             filename = data_file.filename.lower()
             content = await data_file.read()
-            from io import BytesIO, StringIO
+            from io import BytesIO
 
             if filename.endswith(".csv"):
                 df = pd.read_csv(BytesIO(content))
@@ -536,11 +539,16 @@ async def analyze_data(
                     df = pd.read_json(BytesIO(content))
                 except ValueError:
                     df = pd.DataFrame(json.loads(content.decode("utf-8")))
-            elif filename.endswith(".txt"):
+            elif filename.endswith(".png") or filename.endswith(".jpg") or filename.endswith(".jpeg"):
                 try:
-                    df = pd.read_csv(BytesIO(content), sep=None, engine="python")
-                except Exception:
-                    df = pd.DataFrame({"text": content.decode("utf-8").splitlines()})
+                    if PIL_AVAILABLE:
+                        image = Image.open(BytesIO(content))
+                        image = image.convert("RGB")  # ensure RGB format
+                        df = pd.DataFrame({"image": [image]})
+                    else:
+                        raise HTTPException(400, "PIL not available for image processing")
+                except Exception as e:
+                    raise HTTPException(400, f"Image processing failed: {str(e)}")  
             else:
                 raise HTTPException(400, f"Unsupported data file type: {filename}")
 
@@ -550,14 +558,13 @@ async def analyze_data(
             df.to_pickle(temp_pkl.name)
             pickle_path = temp_pkl.name
 
-            # Preview for LLM
             df_preview = (
                 f"\n\nThe uploaded dataset has {len(df)} rows and {len(df.columns)} columns.\n"
                 f"Columns: {', '.join(df.columns.astype(str))}\n"
                 f"First rows:\n{df.head(5).to_markdown(index=False)}\n"
             )
 
-        # Dynamic prompt rules
+        # Build rules based on data presence
         if dataset_uploaded:
             llm_rules = (
                 "Rules:\n"
@@ -585,7 +592,7 @@ async def analyze_data(
             "Respond with the JSON object only."
         )
 
-        # Run unified agent
+        # Run agent
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as ex:
             fut = ex.submit(run_agent_safely_unified, llm_input, pickle_path)
@@ -597,6 +604,23 @@ async def analyze_data(
         if "error" in result:
             raise HTTPException(500, detail=result["error"])
 
+        # Post-process key mapping & type casting
+        if keys_list and type_map:
+            mapped = {}
+            for idx, q in enumerate(result.keys()):
+                if idx < len(keys_list):
+                    key = keys_list[idx]
+                    caster = type_map.get(key, str)
+                    try:
+                        val = result[q]
+                        if isinstance(val, str) and val.startswith("data:image/"):
+                            # Remove data URI prefix
+                            val = val.split(",", 1)[1] if "," in val else val
+                        mapped[key] = caster(val) if val not in (None, "") else val
+                    except Exception:
+                        mapped[key] = result[q]
+            result = mapped
+
         return JSONResponse(content=result)
 
     except HTTPException as he:
@@ -606,18 +630,23 @@ async def analyze_data(
         raise HTTPException(500, detail=str(e))
 
 
-    
 def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
     """
     Runs the LLM agent and executes code.
+    - Retries up to 3 times if agent returns no output.
     - If pickle_path is provided, injects that DataFrame directly.
     - If no pickle_path, falls back to scraping when needed.
     """
     try:
-        response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
-        raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
+        max_retries = 3
+        raw_out = ""
+        for attempt in range(1, max_retries + 1):
+            response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
+            raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
+            if raw_out:
+                break
         if not raw_out:
-            return {"error": "Agent returned no output"}
+            return {"error": f"Agent returned no output after {max_retries} attempts"}
 
         parsed = clean_llm_output(raw_out)
         if "error" in parsed:
@@ -629,7 +658,6 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
         code = parsed["code"]
         questions = parsed["questions"]
 
-        # If no pickle provided, check if code tries to scrape
         if pickle_path is None:
             urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
             if urls:
@@ -643,7 +671,6 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
                 df.to_pickle(temp_pkl.name)
                 pickle_path = temp_pkl.name
 
-        # Execute code with pickle injection if available
         exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
         if exec_result.get("status") != "success":
             return {"error": f"Execution failed: {exec_result.get('message')}", "raw": exec_result.get("raw")}
@@ -654,7 +681,36 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
     except Exception as e:
         logger.exception("run_agent_safely_unified failed")
         return {"error": str(e)}
+
+
     
+from fastapi.responses import FileResponse, Response
+import base64, os
+
+# 1×1 transparent PNG fallback (if favicon.ico file not present)
+_FAVICON_FALLBACK_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3n+9QAAAAASUVORK5CYII="
+)
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """
+    Serve favicon.ico if present in the working directory.
+    Otherwise return a tiny transparent PNG to avoid 404s.
+    """
+    path = "favicon.ico"
+    if os.path.exists(path):
+        return FileResponse(path, media_type="image/x-icon")
+    return Response(content=_FAVICON_FALLBACK_PNG, media_type="image/png")
+
+@app.get("/api", include_in_schema=False)
+async def analyze_get_info():
+    """Health/info endpoint. Use POST /api for actual analysis."""
+    return JSONResponse({
+        "ok": True,
+        "message": "Server is running. Use POST /api with 'questions_file' and optional 'data_file'.",
+
+    })
 
 if __name__ == "__main__":
     import uvicorn
